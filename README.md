@@ -102,3 +102,37 @@ Beheer van configuraties wordt overzichtelijk, omdat er geen dynamische mapping 
  #### Nadelen
  - Kans op ID-conflicten. Als meerdere samples dezelfde ID’s gebruiken voor verschillende apparaten of requests, kan dit leiden tot conflicten en onverwachte gedrag.
  - Complexiteit bij schaalvergroting, Bij een groot aantal apparaten, servers en requests wordt de vooraf gedefinieerde ID-lijst snel omvangrijk en moeilijk te beheren.
+
+
+ #### Nadelen Beperken
+
+   - **Centraal ID-register**
+    Houd een centrale lijst bij van alle gebruikte ID’s voor devices, servers en requests.
+    Dit register kan automatisch checken of een nieuwe sample een unieke ID krijgt.
+    Het kan ook gebruikt worden om conflicten op te sporen bij meerdere ontwikkelaars.
+  - **Conflict detectie**
+    Als meerdere samples of requests elkaar overlappen, kan het systeem waarschuwingen geven.
+  - **Audit/logging:**
+    Bij aanpassingen kan worden bijgehouden wie welke configuratie heeft aangepast en waarom.
+
+
+| Type        | Range  | Opmerkingen                                  |
+| ----------- | ------ | -------------------------------------------- |
+| RTU Devices | 0–49   | Fysieke interfaces, zoals `/dev/rs485`       |
+| RTU Servers | 50–499 | Apparaten aangesloten op een device          |
+| Requests    | 500–∞  | Specifieke lees- of schrijfacties per server |
+
+**RTU Devices**:
+    Device 1 → ID 1
+    Device 2 → ID 2
+
+**RTU Servers:**
+    EnergieMeter → ID 50 (op Device 1)
+    Accu         → ID 51 (op Device 1)
+    WaterMeter   → ID 52 (op Device 2)
+
+**Requests:**
+power_received_l1  → ID 500 (Server 50)
+power_delivered_l1 → ID 501 (Server 50)
+SOC               → ID 502 (Server 51)
+total_power       → ID 503 (Server 50)
