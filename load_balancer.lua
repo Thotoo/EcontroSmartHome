@@ -1,45 +1,56 @@
 package.path = "/etc/scripts/?.lua;" .. package.path
 
+-- Import pure logic module (your testable functions)
+local logic = require("lb_logic")
+
+-- Still using your dependencies
 local Stack = require("stack")
 local json = require("luci.jsonc")
-local CHANGE_TIME = 60 
--- Thresholds
-local POWER_RECEIVED_MAX = 10000      -- Waarschuwing bij onrealistische waarden
-local MAIN_NET_THRESHOLD = 4000         -- Drempel om accu te laden of ontladen
+
+-- ===============================
+-- CONFIG
+-- ===============================
+local CHANGE_TIME = 60
+local POWER_RECEIVED_MAX = 10000
+local MAIN_NET_THRESHOLD = tonumber(arg[2]) or 4000
+local MAX_DISCHARGE_POWER = 2500
+local MAX_CHARGE_POWER = 2500
+local HISTORY_LIMIT = 60
+local UPDATE_INTERVAL = tonumber(arg[1]) or 5
+
+-- Logging config
+local LOG_FILE = "/etc/scripts/battery_log.txt"
+local LOG_WIDTH = 32  -- each value occupies 10 characters (bytes)
+local LOG_INTERVAL = 60  -- seconds between logging
+local last_log_time = 0
 
 -- Modbus IDs
 local ID_POWER_RECEIVED = 2.5
 local ID_POWER_DELIVERED = 2.6
-local ID_GET_CHARGE_MODE = 7.9       -- 0: stop, 1: charge, 2: discharge
-local ID_SOC = 7.8                    -- State of Charge in %
-local ID_SET_CHARGE_MODE = 7.10       -- 0: stop, 1: charge, 2: discharge
+local ID_GET_CHARGE_MODE = 7.9
+local ID_SOC = 7.8
+local ID_SET_CHARGE_MODE = 7.10
+local ID_GET_CHARGE_POWER = 7.13
+local ID_GET_DISCHARGE_POWER = 7.14
+local ID_SET_DISCHARGE_POWER = 7.19
 
 -- Charge modes
 local CHARGE_STOP = 0
 local CHARGE = 1
 local DISCHARGE = 2
 
--- Charge power
-local ID_GET_CHARGE_POWER = 7.13
-local ID_GET_DISCHARGE_POWER = 7.14
-
--- History stacknew_charge_power
-local HISTORY_LIMIT = 60
+-- History storage
 local history = Stack:Create()
 
--- Battery Stats
-local MAX_DISCHARGE_POWER = 2500
-local MAX_CHARGE_POWER = 2500
+-- ===============================
+-- MODBUS FUNCTIONS
+-- ===============================
 
--- Update interval from script argument, default 5 seconds
-local UPDATE_INTERVAL = tonumber(arg[1]) or 5
-
--- Function to read a Modbus tag
 local function read_modbus(id)
-    local cmd = string.format([[
-        ubus call modbus_client.rpc get_tag_value '{"id":"%g", "index":0, "count":1}'
-    ]], id)
-
+    local cmd = string.format(
+        [[ubus call modbus_client.rpc get_tag_value '{"id":"%g","index":0,"count":1}']], 
+        id
+    )
     local handle = io.popen(cmd)
     local output = handle:read("*a")
     handle:close()
@@ -47,118 +58,120 @@ local function read_modbus(id)
     local data = json.parse(output)
     if data and data.values and data.values[1] then
         return tonumber(data.values[1])
-    else
-        return nil
     end
+    return nil
 end
 
--- Function to write a Modbus tag
 local function set_modbus(id, value)
-    local cmd = string.format([[
-        ubus call modbus_client.rpc set_tag_value '{"id":"%s","values":["%s"],"index":0}'
-    ]], id, value)
-
+    local cmd = string.format(
+        [[ubus call modbus_client.rpc set_tag_value '{"id":"%s","values":["%s"],"index":0}']], 
+        tostring(id or ""), tostring(value or 0)
+    )
     local handle = io.popen(cmd)
     handle:read("*a")
     handle:close()
 end
 
--- SmoothIn: weighted smoothing function
-function SmoothIn(previous, new, weight_new)
-    weight_new = weight_new or 2
-    return (previous + new * weight_new) / (1 + weight_new)
-end
+-- ===============================
+-- HISTORY MANAGEMENT
+-- ===============================
 
-local function compareAndClamp(cur, new, min, max)
-    local difference = new - cur
-    local abs = math.abs(difference)
-
-    if abs < min then
-        do return cur end
-    end
-
-    if abs > max then
-        do return difference < -max and cur - max or cur + max end
-    end
-
-    return new
- end
-
- local function compute_slope(history, steps)
-    local entries = history:last(steps)
-    if #entries < steps then return 0 end
-
-    local first_value = entries[1].received
-    local last_value = entries[#entries].received
-    local slope = (last_value - first_value) / ((#entries - 1) * UPDATE_INTERVAL)
-    return slope
-end
-
--- Measure Modbus values and update history
-local function measure_and_update()
-    local raw_power_received = read_modbus(ID_POWER_RECEIVED)
-    local raw_power_delivered = read_modbus(ID_POWER_DELIVERED)
-    local accu_state = read_modbus(ID_GET_CHARGE_MODE)
-    local soc = read_modbus(ID_SOC)
-
-    if raw_power_received and raw_power_received >= POWER_RECEIVED_MAX then
-        print("Waarschuwing: onrealistische waarden gedetecteerd. Gegevens niet verwerkt.")
-        return
-    end
-
-    -- Initialize smoothed values with raw values
-    local Smooth_power_received = raw_power_received or 0
-    local Smooth_power_delivered = raw_power_delivered or 0
-
-    local prev_entry = history._et[#history._et]
-    if prev_entry then
-        Smooth_power_received = SmoothIn(prev_entry.received, raw_power_received, 2)
-        Smooth_power_delivered = SmoothIn(prev_entry.delivered, raw_power_delivered, 2)
-    end
-
-    -- Push raw values to history
+local function push_history(received, delivered, soc)
     history:push({
         timestamp = os.time(),
-        received = Smooth_power_received,
-        delivered = Smooth_power_delivered,
+        received = received,
+        delivered = delivered,
         soc = soc
     })
-
-    -- Keep history within limit
     if history:getn() > HISTORY_LIMIT then
         history:pop_bottom()
     end
-    local slope5s = compute_slope(history, 2)
-    local slope30s = compute_slope(history, 6)
-    local predicted_usage5s = slope5s * 5
-    local predicted_usage30s = slope30s * 30
-    local new_charge_power = compareAndClamp(read_modbus(ID_GET_CHARGE_POWER),Smooth_power_received,0,2500)
-    print(string.format("Raw usage: %g  Smooth usage: %g   5 s slope: %g  30s slope: %g", raw_power_received, Smooth_power_received, predicted_usage5s, predicted_usage30s))
 end
 
--- Main loop
-while true do
-    measure_and_update()
-    os.execute(string.format("sleep %d", UPDATE_INTERVAL))
-end
+-- ===============================
+-- MEASUREMENT + LOGIC PIPELINE
+-- ===============================
 
-if power_received and power_received > SWITCH_THRESHOLD then
-    set_modbus(ID_SET_CHARGE_MODE, tostring(DISCHARGE))
-else
-    if soc and soc >= 100 then
-        set_modbus(ID_SET_CHARGE_MODE, tostring(CHARGE_STOP))
-    elseif accu_state and accu_state ~= CHARGE then
-        set_modbus(ID_SET_CHARGE_MODE, tostring(CHARGE))
+local function format_value(val)
+    -- Convert to string, pad or truncate to LOG_WIDTH bytes
+    local str = string.format("%.2f", val or 0)  -- 2 decimals
+    if #str > LOG_WIDTH then
+        return str:sub(1, LOG_WIDTH)
+    else
+        return str .. string.rep(" ", LOG_WIDTH - #str)
     end
 end
-local formatted = string.format("Power received: %d W | Power delivered: %d W",power_received or 0, power_delivered or 0)
-print(formatted)
 
--- get all tags: 
--- ubus call modbus_client.rpc get_tags 
--- 7.9 read charge mode 
--- 7.10 write charge mode (0: stop 1: charge 2: discharge) 
--- heartbeat 
--- validation 
--- comments 
--- consistentie
+local function log_measurement(received, delivered, soc, mode, charge_power)
+    local file = io.open(LOG_FILE, "w")  -- append mode
+    if not file then return end
+
+    -- Each value on its own line, fixed width
+    file:write(format_value(received) .. "\n")
+    file:write(format_value(delivered) .. "\n")
+    file:write(format_value(soc) .. "\n")
+    file:write(format_value(mode) .. "\n")
+    file:write(format_value(charge_power) .. "\n")
+    file:close()
+end
+
+local function measure_and_update()
+    local raw_received = read_modbus(ID_POWER_RECEIVED)
+    local raw_delivered = read_modbus(ID_POWER_DELIVERED)
+    local accu_state   = tonumber(read_modbus(ID_GET_CHARGE_MODE)) or 4
+    local soc          = read_modbus(ID_SOC)
+
+    if not raw_received or raw_received >= POWER_RECEIVED_MAX then
+        print("⚠️ Waarschuwing: onrealistische waarden gedetecteerd.")
+        return
+    end
+
+    -- Smooth input
+    local prev = history._et[#history._et]
+    local smooth_received = prev and logic.SmoothIn(prev.received, raw_received, 2) or raw_received
+    local smooth_delivered = prev and logic.SmoothIn(prev.delivered, raw_delivered, 2) or raw_delivered
+
+    -- Update history
+    push_history(smooth_received, smooth_delivered, soc)
+
+    -- Compute slopes (pure logic module)
+    local slope5s  = logic.compute_slope(history, 5, UPDATE_INTERVAL)
+    local slope30s = logic.compute_slope(history, 30, UPDATE_INTERVAL)
+
+    -- Prediction
+    local pred5s  = logic.predicted_usage(smooth_received, slope5s, 5)
+    local pred30s = logic.predicted_usage(smooth_received, slope30s, 30)
+
+    -- Compute discharge power (pure logic module)
+    local new_charge_power = logic.compute_discharge(pred30s, MAIN_NET_THRESHOLD, MAX_DISCHARGE_POWER)
+
+    -- If we need to discharge, push settings via Modbus
+    if new_charge_power > 0 then
+        set_modbus(ID_SET_CHARGE_POWER, tostring(new_charge_power))
+
+        local new_mode = logic.determine_mode(soc, accu_state, new_charge_power)
+        set_modbus(ID_SET_CHARGE_MODE, tostring(new_mode))
+    end
+    if now - last_log_time >= LOG_INTERVAL then
+        log_measurement(smooth_received, smooth_delivered, soc, accu_state, new_charge_power)
+        last_log_time = now
+    end
+    -- Debug print
+    print(string.format(
+        "[%s] Raw: %g W  Smooth: %g W  Pred5s: %g W  Pred30s: %g W  Slope5s: %g W/s  Slope30s: %g W/s  Mode: %d  ChargePower: %g W",
+        os.date("%H:%M:%S"),
+        raw_received, smooth_received,
+        pred5s, pred30s,
+        slope5s, slope30s,
+        accu_state, new_charge_power
+    ))
+end
+
+-- ===============================
+-- MAIN LOOP (only runs on device)
+-- ===============================
+
+while true do
+    measure_and_update()
+    os.execute("sleep " .. UPDATE_INTERVAL)
+end
